@@ -1,5 +1,5 @@
 # Paths
-MIMIC_DB = "postgresql://localhost/mimiciv"
+MIMIC_DB = "postgresql://postgres:tanu@localhost:5432/mimiciv"
 DATA_DIR = "data/"
 RESULTS_DIR = "results/"
 
