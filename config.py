@@ -1,5 +1,6 @@
 # Paths
-MIMIC_DB = "postgresql://localhost/mimiciv"
+GCP_PROJECT = "aki-prediction-icu"      # your billing project — where queries run
+PHYSIONET_PROJECT = "physionet-data"    # where the actual MIMIC-IV data lives
 DATA_DIR = "data/"
 RESULTS_DIR = "results/"
 

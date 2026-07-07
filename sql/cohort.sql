@@ -5,17 +5,17 @@ WITH first_stays AS (
     ie.stay_id,
     ie.intime,
     ie.outtime,
-    EXTRACT(EPOCH FROM (ie.outtime - ie.intime))/3600 AS los_hours,
+    TIMESTAMP_DIFF(ie.outtime, ie.intime, MINUTE) / 60.0 AS los_hours,
     p.anchor_age AS age,
     ROW_NUMBER() OVER (PARTITION BY ie.subject_id ORDER BY ie.intime) AS stay_rank
-  FROM mimiciv_icu.icustays ie
-  JOIN mimiciv_hosp.patients p
+  FROM `physionet-data.mimiciv_3_1_icu.icustays` ie
+  JOIN `physionet-data.mimiciv_3_1_hosp.patients` p
     ON ie.subject_id = p.subject_id
-  WHERE EXTRACT(EPOCH FROM (ie.outtime - ie.intime))/3600 >= 24
+  WHERE TIMESTAMP_DIFF(ie.outtime, ie.intime, MINUTE) / 60.0 >= 24
 ),
 prior_aki AS (
   SELECT DISTINCT subject_id
-  FROM mimiciv_hosp.diagnoses_icd
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`
   WHERE icd_code LIKE 'N17%'
 ),
 cohort AS (

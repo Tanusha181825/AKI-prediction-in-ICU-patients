@@ -1,22 +1,29 @@
 import json
+import os
 import pandas as pd
-from sqlalchemy import create_engine
-from config import MIMIC_DB, DATA_DIR
+from google.cloud import bigquery
+from config import GCP_PROJECT, PHYSIONET_PROJECT, DATA_DIR
 
 
-def build_cohort(engine):
+def get_client():
+    return bigquery.Client(project=GCP_PROJECT)
+
+
+def build_cohort(client):
     with open("sql/cohort.sql", "r") as f:
         query = f.read()
 
-    cohort = pd.read_sql(query, engine)
+    cohort = client.query(query).to_dataframe()
+
+    os.makedirs(DATA_DIR, exist_ok=True)
     cohort.to_parquet(f"{DATA_DIR}cohort_base.parquet", index=False)
 
     print(f"Cohort size: {len(cohort)}")
     return cohort
 
 
-def label_aki(engine, cohort, obs_hours=24, outcome_hours=48):
-    query = """
+def label_aki(client, cohort, obs_hours=24, outcome_hours=48):
+    query = f"""
     SELECT
       k.stay_id,
       k.charttime,
@@ -26,56 +33,67 @@ def label_aki(engine, cohort, obs_hours=24, outcome_hours=48):
         COALESCE(k.aki_stage_creat, 0),
         COALESCE(k.aki_stage_uo, 0)
       ) AS aki_stage
-    FROM mimiciv_derived.kdigo_stages k
+    FROM `{PHYSIONET_PROJECT}.mimiciv_3_1_derived.kdigo_stages` k
     """
 
-    kdigo = pd.read_sql(query, engine)
+    kdigo = client.query(query).to_dataframe()
 
-    results = []
+    # Ensure timestamps are proper datetimes for comparison
+    cohort = cohort.copy()
+    cohort["intime"] = pd.to_datetime(cohort["intime"])
+    cohort["outtime"] = pd.to_datetime(cohort["outtime"])
+    kdigo["charttime"] = pd.to_datetime(kdigo["charttime"])
 
-    for _, row in cohort.iterrows():
-        obs_end = row.intime + pd.Timedelta(hours=obs_hours)
-        outcome_end = obs_end + pd.Timedelta(hours=outcome_hours)
+    cohort["obs_end"] = cohort["intime"] + pd.Timedelta(hours=obs_hours)
+    cohort["outcome_end"] = cohort["obs_end"] + pd.Timedelta(hours=outcome_hours)
 
-        obs_window = kdigo[
-            (kdigo.stay_id == row.stay_id)
-            & (kdigo.charttime >= row.intime)
-            & (kdigo.charttime < obs_end)
-        ]
+    # Merge kdigo onto cohort by stay_id (vectorized, not a per-row loop)
+    merged = cohort.merge(kdigo, on="stay_id", how="left")
 
-        if (obs_window.aki_stage > 0).any():
-            continue
+    # Flag rows that fall inside the observation window (pre-existing AKI)
+    in_obs_window = (
+        (merged.charttime >= merged.intime)
+        & (merged.charttime < merged.obs_end)
+        & (merged.aki_stage > 0)
+    )
 
-        outcome_window = kdigo[
-            (kdigo.stay_id == row.stay_id)
-            & (kdigo.charttime >= obs_end)
-            & (kdigo.charttime < outcome_end)
-        ]
+    # Flag rows that fall inside the outcome window (the label we want)
+    in_outcome_window = (
+        (merged.charttime >= merged.obs_end)
+        & (merged.charttime < merged.outcome_end)
+        & (merged.aki_stage > 0)
+    )
 
-        aki_label = int((outcome_window.aki_stage > 0).any())
-        aki_stage = int(outcome_window.aki_stage.max()) if aki_label else 0
-        aki_onset = (
-            outcome_window[outcome_window.aki_stage > 0].charttime.min()
-            if aki_label
-            else pd.NaT
-        )
+    # Per-stay_id: did they already have AKI in the observation window? -> exclude
+    excluded_stays = merged.loc[in_obs_window, "stay_id"].unique()
 
-        results.append({
-            **row.to_dict(),
-            "aki_label": aki_label,
-            "aki_stage": aki_stage,
-            "aki_onset": aki_onset,
-        })
+    # Per-stay_id: aggregate outcome window results
+    outcome_rows = merged[in_outcome_window]
+    agg = outcome_rows.groupby("stay_id").agg(
+        aki_stage=("aki_stage", "max"),
+        aki_onset=("charttime", "min"),
+    )
 
-    return pd.DataFrame(results)
+    cohort = cohort[~cohort.stay_id.isin(excluded_stays)].copy()
+    cohort = cohort.merge(agg, on="stay_id", how="left")
+
+    cohort["aki_label"] = cohort["aki_stage"].notna().astype(int)
+    cohort["aki_stage"] = cohort["aki_stage"].fillna(0).astype(int)
+    # aki_onset stays NaT where aki_label == 0
+
+    cohort = cohort.drop(columns=["obs_end", "outcome_end"])
+
+    return cohort
 
 
-def flag_competing_risk(cohort_labeled, engine):
-    deaths = pd.read_sql("""
+def flag_competing_risk(cohort_labeled, client):
+    query = f"""
         SELECT hadm_id, deathtime
-        FROM mimiciv_hosp.admissions
+        FROM `{PHYSIONET_PROJECT}.mimiciv_3_1_hosp.admissions`
         WHERE deathtime IS NOT NULL
-    """, engine)
+    """
+    deaths = client.query(query).to_dataframe()
+    deaths["deathtime"] = pd.to_datetime(deaths["deathtime"])
 
     cohort_labeled = cohort_labeled.merge(deaths, on="hadm_id", how="left")
 
@@ -111,13 +129,14 @@ def temporal_split(cohort, train_frac=0.60, calib_frac=0.20):
 
 
 def main():
-    engine = create_engine(MIMIC_DB)
+    client = get_client()
 
-    cohort = build_cohort(engine)
+    cohort = build_cohort(client)
 
-    cohort_labeled = label_aki(engine, cohort)
-    cohort_labeled = flag_competing_risk(cohort_labeled, engine)
+    cohort_labeled = label_aki(client, cohort)
+    cohort_labeled = flag_competing_risk(cohort_labeled, client)
 
+    os.makedirs(DATA_DIR, exist_ok=True)
     cohort_labeled.to_parquet(f"{DATA_DIR}cohort.parquet", index=False)
 
     print(cohort_labeled.aki_label.value_counts())
