@@ -100,7 +100,7 @@ def run_al_loop():
     learning_curve = []
     mask_history = [current_mask.copy()]
     mask_frozen = False
-    budget = int(0.15 * len(X_train))
+    budget = int(0.2 * len(X_train))
 
     for iteration in range(MAX_ITER):
         n_labeled = len(labeled_ids)
